@@ -24,7 +24,7 @@ SAMPLE_RATE = 24000
 DEFAULT_BASE_URL = "http://192.168.1.3:8901/v1"
 DEFAULT_API_KEY = "local"
 DEFAULT_TEXT_MODEL = None
-DEFAULT_WS_URL = "ws://127.0.0.1:3000/stream-text"
+DEFAULT_WS_URL = "ws://192.168.1.3:3000/stream-text"
 
 
 def stream_text(client: OpenAI, prompt: str, model: str) -> Iterator[str]:
