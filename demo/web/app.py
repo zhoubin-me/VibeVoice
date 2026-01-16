@@ -360,6 +360,21 @@ def streaming_tts(text: str, **kwargs) -> Iterator[np.ndarray]:
     service: StreamingTTSService = app.state.tts_service
     yield from service.stream(text, **kwargs)
 
+
+def _parse_streamed_text_message(payload: str) -> Tuple[Optional[str], bool]:
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return payload, False
+
+    if isinstance(data, dict):
+        msg_type = data.get("type")
+        if msg_type == "end":
+            return None, True
+        if msg_type == "text":
+            return str(data.get("data", "")), False
+    return None, False
+
 @app.websocket("/stream")
 async def websocket_stream(ws: WebSocket) -> None:
     await ws.accept()
@@ -491,6 +506,98 @@ async def websocket_stream(ws: WebSocket) -> None:
             lock.release()
 
 
+@app.websocket("/stream-text")
+async def websocket_stream_text(ws: WebSocket) -> None:
+    await ws.accept()
+    cfg_param = ws.query_params.get("cfg")
+    steps_param = ws.query_params.get("steps")
+    voice_param = ws.query_params.get("voice")
+
+    try:
+        cfg_scale = float(cfg_param) if cfg_param is not None else 1.5
+    except ValueError:
+        cfg_scale = 1.5
+    if cfg_scale <= 0:
+        cfg_scale = 1.5
+    try:
+        inference_steps = int(steps_param) if steps_param is not None else None
+        if inference_steps is not None and inference_steps <= 0:
+            inference_steps = None
+    except ValueError:
+        inference_steps = None
+
+    service: StreamingTTSService = app.state.tts_service
+    lock: asyncio.Lock = app.state.websocket_lock
+
+    if lock.locked():
+        try:
+            await ws.send_text(json.dumps({
+                "type": "log",
+                "event": "backend_busy",
+                "data": {"message": "Please wait for the other requests to complete."},
+                "timestamp": get_timestamp(),
+            }))
+        except Exception:
+            pass
+        await ws.close(code=1013, reason="Service busy")
+        return
+
+    acquired = False
+    try:
+        await lock.acquire()
+        acquired = True
+
+        text_parts = []
+        try:
+            while ws.client_state == WebSocketState.CONNECTED:
+                payload = await ws.receive_text()
+                text_chunk, is_end = _parse_streamed_text_message(payload)
+                if is_end:
+                    break
+                if text_chunk is not None:
+                    text_parts.append(text_chunk)
+        except WebSocketDisconnect:
+            return
+
+        text = "".join(text_parts).strip()
+        if not text:
+            await ws.close(code=1000)
+            return
+
+        stop_signal = threading.Event()
+        iterator = streaming_tts(
+            text,
+            cfg_scale=cfg_scale,
+            inference_steps=inference_steps,
+            voice_key=voice_param,
+            stop_event=stop_signal,
+        )
+        sentinel = object()
+        try:
+            while ws.client_state == WebSocketState.CONNECTED:
+                chunk = await asyncio.to_thread(next, iterator, sentinel)
+                if chunk is sentinel:
+                    break
+                chunk = cast(np.ndarray, chunk)
+                payload = service.chunk_to_pcm16(chunk)
+                await ws.send_bytes(payload)
+        except WebSocketDisconnect:
+            stop_signal.set()
+        finally:
+            stop_signal.set()
+            try:
+                iterator_close = getattr(iterator, "close", None)
+                if callable(iterator_close):
+                    iterator_close()
+            except Exception:
+                pass
+            if ws.client_state == WebSocketState.CONNECTED:
+                await ws.close()
+    finally:
+        if acquired:
+            lock.release()
+
+
 @app.get("/")
 def index():
     return FileResponse(BASE / "index.html")
@@ -504,4 +611,3 @@ def get_config():
         "voices": voices,
         "default_voice": service.default_voice_key,
     }
-
